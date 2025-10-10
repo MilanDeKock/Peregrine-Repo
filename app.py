@@ -14,7 +14,12 @@ DIGISCALE_GREEN = "3E5D3E"  # RGB(62,93,62)
 # -------------------------
 # Streamlit Page Setup
 # -------------------------
-st.set_page_config(page_title="Core | Yoco | Digiscale Reconciliation", page_icon="🧾", layout="centered")
+st.set_page_config(
+    page_title="Core | Yoco | Digiscale Reconciliation",
+    page_icon="🧾",
+    layout="wide"  # instead of "centered"
+)
+
 st.title("🧾 Core | Yoco | Digiscale Reconciliation")
 st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
 
