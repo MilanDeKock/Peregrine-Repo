@@ -98,7 +98,7 @@ def map_first_available(df, candidates, require_tokens=None):
 with st.form("inputs"):
     st.subheader("Please upload files")
     uploaded_files = st.file_uploader(
-        "Upload your Core CSV, Yoco XLSX, Modifiers (optional), and Digiscale/PLU Listing CSV all at once:",
+        "Upload the Core Inventory, Yoco Products & Modifiers, and Digiscale export files in the section below:",
         accept_multiple_files=True,
         type=["csv", "xlsx", "xls"]
     )
