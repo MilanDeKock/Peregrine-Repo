@@ -8,18 +8,22 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border
 
 TZ = timezone("Africa/Johannesburg")
-PEREGRINE_BLUE = "00A9E0"   # RGB(0,169,224) as hex (we'll convert for openpyxl)
+PEREGRINE_BLUE = "00A9E0"   # RGB(0,169,224)
 DIGISCALE_GREEN = "3E5D3E"  # RGB(62,93,62)
 
 # -------------------------
 # Streamlit Page Setup
 # -------------------------
-st.set_page_config(
-    page_title="Core | Yoco | Digiscale Reconciliation",
-    page_icon="🧾",
-    layout="wide"  # instead of "centered"
+st.set_page_config(page_title="Core | Yoco | Digiscale Reconciliation", page_icon="🧾", layout="centered")
+# (optional) keep long title/caption on one line:
+st.markdown(
+    """
+    <style>
+    h1, .stMarkdown h1, .stCaption p { white-space: nowrap !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
-
 st.title("🧾 Core | Yoco | Digiscale Reconciliation")
 st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
 
@@ -29,12 +33,7 @@ st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
 def style_and_autofit_sheet(ws, rgb_hex="00A9E0"):
     """Header style + autofit. rgb_hex like '00A9E0' or '3E5D3E'. Converted to ARGB for openpyxl."""
     rgb = rgb_hex.replace("#", "").upper()
-    if len(rgb) == 6:
-        argb = "00" + rgb  # common pattern used with openpyxl themes
-    elif len(rgb) == 8:
-        argb = rgb
-    else:
-        argb = "00A9E0"
+    argb = ("00" + rgb) if len(rgb) == 6 else (rgb if len(rgb) == 8 else "00A9E0")
 
     header_fill = PatternFill(start_color=argb, end_color=argb, fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
@@ -57,11 +56,6 @@ def style_and_autofit_sheet(ws, rgb_hex="00A9E0"):
             if len(v) > max_len:
                 max_len = len(v)
         ws.column_dimensions[col_letter].width = max(10, max_len + 2)
-
-def pick_latest_by_name(files, *need_any_substr):
-    """Return the last uploaded file whose name contains ANY of the substrings (case-insensitive)."""
-    matches = [f for f in files if any(s in f.name.lower() for s in need_any_substr)]
-    return matches[-1] if matches else None
 
 def read_core_csv(uploaded):
     try:
@@ -92,13 +86,17 @@ def map_first_available(df, candidates, require_tokens=None):
                 return raw
     return None
 
+def norm_plu_series(s):
+    """Case-insensitive PLU matching: trim + UPPERCASE (digits unchanged)."""
+    return s.astype(str).str.strip().str.upper()
+
 # -------------------------
 # File Upload Section (single upload control)
 # -------------------------
 with st.form("inputs"):
     st.subheader("Please upload files")
     uploaded_files = st.file_uploader(
-        "Upload the Core Inventory, Yoco Products & Modifiers, and Digiscale export files in the section below:",
+        "Upload your Core CSV, Yoco XLSX, Modifiers (optional), and Digiscale/PLU Listing CSV all at once:",
         accept_multiple_files=True,
         type=["csv", "xlsx", "xls"]
     )
@@ -181,7 +179,6 @@ if mod_df is None and modifiers_alt is not None:
         if "Modifier Items - Template" in xls_alt.sheet_names:
             mod_df = xls_alt.parse("Modifier Items - Template")
         else:
-            # pick first sheet with "modifier" else first sheet
             cand = next((s for s in xls_alt.sheet_names if "modifier" in s.lower()), xls_alt.sheet_names[0])
             mod_df = xls_alt.parse(cand)
     except Exception as e:
@@ -202,13 +199,18 @@ if digiscale_file:
         st.stop()
 
 # -------------------------
-# Reconciliations
+# Reconciliations (case-insensitive PLU joins)
 # -------------------------
 # 1) Yoco products vs Core
+yoco_df = yoco_df.copy()
+core_df = core_df.copy()
+yoco_df["PLU_norm"] = norm_plu_series(yoco_df["Product PLU"])
+core_df["ProductCode_norm"] = norm_plu_series(core_df["ProductCode"])
+
 prod_merge = yoco_df.merge(
-    core_df[["ProductCode", "PriceTier1"]],
-    left_on="Product PLU",
-    right_on="ProductCode",
+    core_df[["ProductCode", "PriceTier1", "ProductCode_norm"]],
+    left_on="PLU_norm",
+    right_on="ProductCode_norm",
     how="left"
 )
 
@@ -219,9 +221,9 @@ yoco_not_in_core = (
 
 y_price = pd.to_numeric(prod_merge["Selling Price"], errors="coerce")
 c_price = pd.to_numeric(prod_merge["PriceTier1"], errors="coerce")
-has_core = prod_merge["ProductCode"].notna()
+has_core_prod = prod_merge["ProductCode"].notna()
 yoco_price_mismatch = (
-    prod_merge.loc[has_core & (y_price.ne(c_price)), ["Product PLU", "Name & Variants", "Selling Price", "PriceTier1"]]
+    prod_merge.loc[has_core_prod & (y_price.ne(c_price)), ["Product PLU", "Name & Variants", "Selling Price", "PriceTier1"]]
     .rename(columns={"Selling Price": "Yoco Price", "PriceTier1": "Core Price"})
 )
 
@@ -244,20 +246,15 @@ if not mod_code_col:
     st.stop()
 
 mod_name_col = map_first_available(
-    mod_df,
-    candidates=["modifier name", "name"],
-    require_tokens=["modifier", "name"]
+    mod_df, candidates=["modifier name", "name"], require_tokens=["modifier", "name"]
 ) or map_first_available(mod_df, candidates=["name"])
 
 mod_type_col = map_first_available(
-    mod_df,
-    candidates=["type products options", "type products options ", "type"],
+    mod_df, candidates=["type products options", "type products options ", "type"]
 )
 
 mod_item_col = map_first_available(
-    mod_df,
-    candidates=["modifier item", "modifier items", "item"],
-    require_tokens=["modifier", "item"]
+    mod_df, candidates=["modifier item", "modifier items", "item"], require_tokens=["modifier", "item"]
 ) or map_first_available(mod_df, candidates=["item"])
 
 missing_disp = [c for c, v in {
@@ -269,12 +266,19 @@ if missing_disp:
     st.error(f"Modifiers sheet missing columns: {missing_disp}")
     st.stop()
 
-mods_merged = mod_df.merge(
-    core_df[["ProductCode"]],
-    left_on=mod_code_col,
-    right_on="ProductCode",
+_mod = mod_df.copy()
+_mod["_PLU_norm"] = norm_plu_series(_mod[mod_code_col])
+
+_core_codes = core_df[["ProductCode"]].copy()
+_core_codes["_PC_norm"] = norm_plu_series(_core_codes["ProductCode"])
+
+mods_merged = _mod.merge(
+    _core_codes,
+    left_on="_PLU_norm",
+    right_on="_PC_norm",
     how="left"
 )
+
 mods_not_in_core = mods_merged[mods_merged["ProductCode"].isna()][[mod_name_col, mod_type_col, mod_item_col]].copy()
 mods_not_in_core.columns = ["Modifier Name", "Type (Products / Options)", "Modifier Item"]
 
@@ -287,11 +291,17 @@ if digi_df is not None and not digi_df.empty:
         st.stop()
 
     digi = digi_df.copy()
-    digi["PLU #"] = digi["PLU #"].astype(str).str.strip()
-    core_map = core_df[["ProductCode", "PriceTier1"]].copy()
-    core_map["ProductCode"] = core_map["ProductCode"].astype(str).str.strip()
+    digi["_PLU_norm"] = norm_plu_series(digi["PLU #"])
 
-    digi_merged = digi.merge(core_map, left_on="PLU #", right_on="ProductCode", how="left")
+    core_map = core_df[["ProductCode", "PriceTier1"]].copy()
+    core_map["_PC_norm"] = norm_plu_series(core_map["ProductCode"])
+
+    digi_merged = digi.merge(
+        core_map[["ProductCode", "PriceTier1", "_PC_norm"]],
+        left_on="_PLU_norm",
+        right_on="_PC_norm",
+        how="left"
+    )
 
     digi_not_in_core = (
         digi_merged[digi_merged["ProductCode"].isna()][["PLU #", "Description Line 1"]]
@@ -300,9 +310,9 @@ if digi_df is not None and not digi_df.empty:
 
     d_price = pd.to_numeric(digi_merged["Price"], errors="coerce")
     c_price2 = pd.to_numeric(digi_merged["PriceTier1"], errors="coerce")
-    has_core2 = digi_merged["ProductCode"].notna()
+    has_core_digi = digi_merged["ProductCode"].notna()
     digi_price_mismatch = (
-        digi_merged.loc[has_core2 & (d_price.ne(c_price2)), ["PLU #", "Description Line 1", "Price", "PriceTier1"]]
+        digi_merged.loc[has_core_digi & (d_price.ne(c_price2)), ["PLU #", "Description Line 1", "Price", "PriceTier1"]]
         .rename(columns={
             "PLU #": "Digiscale SKU",
             "Description Line 1": "Digiscale Name",
@@ -321,6 +331,7 @@ ts = datetime.now(TZ).strftime("%Y-%m-%d_%H%M")
 out_xlsx = io.BytesIO()
 
 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+    # Sheets
     yoco_not_in_core.to_excel(writer, index=False, sheet_name="Yoco Products - Not in Core")
     yoco_price_mismatch.to_excel(writer, index=False, sheet_name="Yoco Products - Price Mismatch")
     mods_not_in_core.to_excel(writer, index=False, sheet_name="Modifiers - Not in Core")
@@ -359,4 +370,3 @@ with st.expander("Show summary"):
         "Digiscale - Not in Core": len(digi_not_in_core),
         "Digiscale - Price Mismatch": len(digi_price_mismatch),
     })
-
