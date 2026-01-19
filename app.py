@@ -144,7 +144,7 @@ if "ProductCode" not in core_df.columns:
     st.error("Core CSV must include 'ProductCode'.")
     st.stop()
 
-need_core = {"ProductCode", "PriceTier1", "Sellable", "Name"}
+need_core = {"ProductCode", "PriceTier1", "Sellable"}
 missing_core = need_core - set(core_df.columns)
 if missing_core:
     st.error(f"Core CSV missing required column(s): {missing_core}")
@@ -229,7 +229,7 @@ yoco_price_mismatch = (
 
 # 2) Core sellable products vs Yoco
 sellable_mask = core_df["Sellable"].astype(str).str.strip().str.lower().eq("yes")
-core_sellable = core_df.loc[sellable_mask, ["ProductCode", "Name", "ProductCode_norm"]]
+core_sellable = core_df.loc[sellable_mask, ["ProductCode", "ProductCode_norm"]]
 core_sellable_merge = core_sellable.merge(
     yoco_df[["Product PLU", "PLU_norm"]],
     left_on="ProductCode_norm",
@@ -237,8 +237,8 @@ core_sellable_merge = core_sellable.merge(
     how="left"
 )
 core_sellable_not_in_yoco = (
-    core_sellable_merge[core_sellable_merge["Product PLU"].isna()][["ProductCode", "Name"]]
-    .rename(columns={"ProductCode": "Core Product Code", "Name": "Core Name"})
+    core_sellable_merge[core_sellable_merge["Product PLU"].isna()][["ProductCode"]]
+    .rename(columns={"ProductCode": "Core Product Code"})
 )
 
 # 3) Modifiers not in Core
