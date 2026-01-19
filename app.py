@@ -144,7 +144,7 @@ if "ProductCode" not in core_df.columns:
     st.error("Core CSV must include 'ProductCode'.")
     st.stop()
 
-need_core = {"ProductCode", "PriceTier1"}
+need_core = {"ProductCode", "PriceTier1", "Sellable"}
 missing_core = need_core - set(core_df.columns)
 if missing_core:
     st.error(f"Core CSV missing required column(s): {missing_core}")
@@ -227,7 +227,21 @@ yoco_price_mismatch = (
     .rename(columns={"Selling Price": "Yoco Price", "PriceTier1": "Core Price"})
 )
 
-# 2) Modifiers not in Core
+# 2) Core sellable products vs Yoco
+sellable_mask = core_df["Sellable"].astype(str).str.strip().str.lower().eq("yes")
+core_sellable = core_df.loc[sellable_mask, ["ProductCode", "ProductCode_norm"]]
+core_sellable_merge = core_sellable.merge(
+    yoco_df[["Product PLU", "PLU_norm"]],
+    left_on="ProductCode_norm",
+    right_on="PLU_norm",
+    how="left"
+)
+core_sellable_not_in_yoco = (
+    core_sellable_merge[core_sellable_merge["Product PLU"].isna()][["ProductCode"]]
+    .rename(columns={"ProductCode": "Core Product Code"})
+)
+
+# 3) Modifiers not in Core
 mod_code_col = map_first_available(
     mod_df,
     candidates=[
@@ -282,7 +296,7 @@ mods_merged = _mod.merge(
 mods_not_in_core = mods_merged[mods_merged["ProductCode"].isna()][[mod_name_col, mod_type_col, mod_item_col]].copy()
 mods_not_in_core.columns = ["Modifier Name", "Type (Products / Options)", "Modifier Item"]
 
-# 3) Digiscale (optional) — PLU and price checks
+# 4) Digiscale (optional) — PLU and price checks
 if digi_df is not None and not digi_df.empty:
     need_digi = {"PLU #", "Description Line 1", "Price"}
     missing_digi = need_digi - set(digi_df.columns)
@@ -334,6 +348,7 @@ with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
     # Sheets
     yoco_not_in_core.to_excel(writer, index=False, sheet_name="Yoco Products - Not in Core")
     yoco_price_mismatch.to_excel(writer, index=False, sheet_name="Yoco Products - Price Mismatch")
+    core_sellable_not_in_yoco.to_excel(writer, index=False, sheet_name="Core Sellable - Not in Yoco")
     mods_not_in_core.to_excel(writer, index=False, sheet_name="Modifiers - Not in Core")
     digi_not_in_core.to_excel(writer, index=False, sheet_name="Digiscale - Not in Core")
     digi_price_mismatch.to_excel(writer, index=False, sheet_name="Digiscale - Price Mismatch")
@@ -341,7 +356,7 @@ with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
     # Style after writing
     wb = writer.book
     # Yoco/Modifiers (blue)
-    for s in ["Yoco Products - Not in Core", "Yoco Products - Price Mismatch", "Modifiers - Not in Core"]:
+    for s in ["Yoco Products - Not in Core", "Yoco Products - Price Mismatch", "Core Sellable - Not in Yoco", "Modifiers - Not in Core"]:
         if s in wb.sheetnames:
             style_and_autofit_sheet(wb[s], rgb_hex=PEREGRINE_BLUE)
     # Digiscale (green)
@@ -366,6 +381,7 @@ with st.expander("Show summary"):
     st.write({
         "Yoco Products - Not in Core": len(yoco_not_in_core),
         "Yoco Products - Price Mismatch": len(yoco_price_mismatch),
+        "Core Sellable - Not in Yoco": len(core_sellable_not_in_yoco),
         "Modifiers - Not in Core": len(mods_not_in_core),
         "Digiscale - Not in Core": len(digi_not_in_core),
         "Digiscale - Price Mismatch": len(digi_price_mismatch),
