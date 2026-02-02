@@ -284,13 +284,18 @@ if health_file:
         st.write("**Bottom 5 Margins**")
         st.dataframe(low_margin_df[["ProductSKU", "ProductName", "GP_Clean"]].rename(columns={"GP_Clean": "GP Margin %"}), hide_index=True)
 
-        # --- Updated Email Summary ---
+# --- Email & Subject Generation ---
+        st.divider()
         st.subheader("✉️ Email Summary")
+        
+        # Dynamic Subject Line
+        current_date = datetime.now(TZ).strftime("%d/%m/%Y")
+        subject_line = f"System Recon and Cin7 Report Summary {current_date}"
         
         # Calculate summary strings for the email
         margin_summary = f"{neg_margin_count} items identified with negative margins and {high_margin_count} items with margins above 80%."
         
-        email_body = f"""Hi Team,
+        email_body = f"""Hi Pergrine Team,
 
 Please find the reconciliation and health check summary for the period:
 
@@ -312,7 +317,9 @@ Please refer to the attached reports for the full details.
 
 Best regards,"""
 
-        st.text_area("Copy and paste this summary into your email body:", value=email_body, height=450)
+        # UI for Subject and Body
+        st.text_input("Email Subject:", value=subject_line)
+        st.text_area("Email Body:", value=email_body, height=450)
         
     except Exception as e:
         st.error(f"Error in Phase 2: {e}")
