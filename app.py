@@ -16,7 +16,7 @@ PEREGRINE_BLUE = "00A9E0"   # RGB(0,169,224)
 DIGISCALE_GREEN = "3E5D3E"  # RGB(62,93,62)
 README_RED = "FF0000"       # RGB(255,0,0)
 
-st.set_page_config(page_title="Core | Yoco | Digiscale Reconciliation - Cin7 Report Summary", page_icon="🧾", layout="centered")
+st.set_page_config(page_title="Systems Reconciliation | Cin7 Report Summary", page_icon="🧾", layout="centered")
 
 st.markdown(
     """
@@ -105,7 +105,7 @@ def norm_plu_series(s):
 # -------------------------
 # UI: File Upload
 # -------------------------
-st.title("🧾 Core | Yoco | Digiscale Reconciliation - Cin7 Report Summary")
+st.title("🧾 systems Reconciliation | Cin7 Report Summary")
 st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
 
 with st.form("inputs"):
