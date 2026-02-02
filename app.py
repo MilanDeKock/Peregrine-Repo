@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import datetime
 from pytz import timezone
 
@@ -7,15 +8,16 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border
 
+# -------------------------
+# Configuration & Styling
+# -------------------------
 TZ = timezone("Africa/Johannesburg")
 PEREGRINE_BLUE = "00A9E0"   # RGB(0,169,224)
 DIGISCALE_GREEN = "3E5D3E"  # RGB(62,93,62)
+README_RED = "FF0000"       # RGB(255,0,0)
 
-# -------------------------
-# Streamlit Page Setup
-# -------------------------
 st.set_page_config(page_title="Core | Yoco | Digiscale Reconciliation", page_icon="🧾", layout="centered")
-# (optional) keep long title/caption on one line:
+
 st.markdown(
     """
     <style>
@@ -24,14 +26,12 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.title("🧾 Core | Yoco | Digiscale Reconciliation")
-st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
 
 # -------------------------
 # Helpers
 # -------------------------
 def style_and_autofit_sheet(ws, rgb_hex="00A9E0"):
-    """Header style + autofit. rgb_hex like '00A9E0' or '3E5D3E'. Converted to ARGB for openpyxl."""
+    """Header style + autofit. rgb_hex like '00A9E0' or '3E5D3E'."""
     rgb = rgb_hex.replace("#", "").upper()
     argb = ("00" + rgb) if len(rgb) == 6 else (rgb if len(rgb) == 8 else "00A9E0")
 
@@ -47,7 +47,6 @@ def style_and_autofit_sheet(ws, rgb_hex="00A9E0"):
             cell.alignment = header_align
             cell.border = no_border
 
-    # Autofit widths
     for col in ws.columns:
         max_len = 0
         col_letter = col[0].column_letter
@@ -56,6 +55,25 @@ def style_and_autofit_sheet(ws, rgb_hex="00A9E0"):
             if len(v) > max_len:
                 max_len = len(v)
         ws.column_dimensions[col_letter].width = max(10, max_len + 2)
+
+def create_readme(writer):
+    """Creates the README sheet at index 0 with a Red Tab."""
+    wb = writer.book
+    ws = wb.create_sheet("README", 0)
+    ws.sheet_properties.tabColor = README_RED
+    
+    content = [
+        ["SHEET NAME", "PURPOSE / ACTION REQUIRED"],
+        ["Yoco Products - Not in Core", "Items found in Yoco but missing from Core. Action: Add to Core or fix SKU."],
+        ["Yoco Products - Price Mismatch", "Selling prices don't match. Action: Sync prices between systems."],
+        ["Core Sellable - Not in Yoco", "Items marked 'Sellable' in Core but missing from Yoco. Action: Add to Yoco."],
+        ["Modifiers - Not in Core", "Modifier items missing from Core. Action: Ensure all modifiers have Core PLUs."],
+        ["Digiscale - Not in Core", "Items on the Digiscale list not found in Core. Action: Update Core inventory."],
+        ["Digiscale - Price Mismatch", "Scale prices vs Core prices. Action: Update scale pricing."]
+    ]
+    for row in content:
+        ws.append(row)
+    style_and_autofit_sheet(ws, rgb_hex=README_RED)
 
 def read_core_csv(uploaded):
     try:
@@ -70,7 +88,6 @@ def read_excel_sheet(uploaded_file, sheet_name):
     return xls.parse(sheet_name)
 
 def norm(s):
-    import re
     return re.sub(r'[^a-z0-9]+', ' ', str(s).lower()).strip()
 
 def map_first_available(df, candidates, require_tokens=None):
@@ -87,265 +104,97 @@ def map_first_available(df, candidates, require_tokens=None):
     return None
 
 def norm_plu_series(s):
-    """Case-insensitive PLU matching: trim + UPPERCASE (digits unchanged)."""
     return s.astype(str).str.strip().str.upper()
 
 # -------------------------
-# File Upload Section (single upload control)
+# UI: File Upload Section
 # -------------------------
+st.title("🧾 Core | Yoco | Digiscale Reconciliation")
+st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
+
 with st.form("inputs"):
-    st.subheader("Please upload files")
+    st.subheader("Please upload reconciliation files")
     uploaded_files = st.file_uploader(
-        "Upload your Core CSV, Yoco XLSX, Modifiers (optional), and Digiscale/PLU Listing CSV all at once:",
+        "Upload Core CSV, Yoco XLSX, Modifiers, and Digiscale CSV all at once:",
         accept_multiple_files=True,
         type=["csv", "xlsx", "xls"]
     )
     run_btn = st.form_submit_button("Run reconciliation")
 
 if not run_btn:
-    st.info("Upload all required files above and click **Run reconciliation**.")
+    st.info("Upload required files above to start Phase 1.")
     st.stop()
 
 # -------------------------
-# Detect file types automatically
+# Phase 1 Logic
 # -------------------------
-core_file = None
-yoco_file = None
-modifiers_alt = None
-digiscale_file = None
+core_file = yoco_file = modifiers_alt = digiscale_file = None
 
 for f in uploaded_files or []:
     name = f.name.lower()
-    if "inventorylist" in name:
-        core_file = f
-    elif "peregrine" in name and "farm" in name and "bulk" in name:
-        yoco_file = f
-    elif "modifier" in name:
-        modifiers_alt = f
-    elif "digiscale" in name or "plu listing" in name:
-        digiscale_file = f
+    if "inventorylist" in name: core_file = f
+    elif "peregrine" in name and "farm" in name and "bulk" in name: yoco_file = f
+    elif "modifier" in name: modifiers_alt = f
+    elif "digiscale" in name or "plu listing" in name: digiscale_file = f
 
-# Validation
 if not core_file or not yoco_file:
-    st.error("You must include both a Core Inventory CSV (contains 'inventorylist') and a Yoco BULK XLSX.")
+    st.error("Missing Core Inventory CSV or Yoco BULK XLSX.")
     st.stop()
 
-# -------------------------
-# Load Data
-# -------------------------
-# Core
-try:
-    core_df = read_core_csv(core_file)
-except Exception as e:
-    st.error(f"Failed to read Core CSV: {e}")
-    st.stop()
+# Data Loading
+core_df = read_core_csv(core_file)
+yoco_df = read_excel_sheet(yoco_file, "Bulk Site Values")
 
-if "ProductCode" not in core_df.columns:
-    st.error("Core CSV must include 'ProductCode'.")
-    st.stop()
-
-need_core = {"ProductCode", "PriceTier1", "Sellable", "Name"}
-missing_core = need_core - set(core_df.columns)
-if missing_core:
-    st.error(f"Core CSV missing required column(s): {missing_core}")
-    st.stop()
-
-# Yoco BULK sheet
-BULK_SHEET = "Bulk Site Values"
-try:
-    yoco_df = read_excel_sheet(yoco_file, BULK_SHEET)
-except Exception as e:
-    st.error(f"Failed to read Yoco BULK sheet: {e}")
-    st.stop()
-
-need_yoco = {"Product PLU", "Name & Variants", "Selling Price"}
-missing_yoco = need_yoco - set(yoco_df.columns)
-if missing_yoco:
-    st.error(f"Yoco BULK missing columns: {missing_yoco}")
-    st.stop()
-
-# Modifiers — prefer same workbook (sheet 'Modifier Items - Template'), else fallback file
-mod_df = None
-try:
-    xls = pd.ExcelFile(yoco_file)
-    if "Modifier Items - Template" in xls.sheet_names:
-        mod_df = xls.parse("Modifier Items - Template")
-except Exception:
-    pass
-
-if mod_df is None and modifiers_alt is not None:
-    try:
-        xls_alt = pd.ExcelFile(modifiers_alt)
-        if "Modifier Items - Template" in xls_alt.sheet_names:
-            mod_df = xls_alt.parse("Modifier Items - Template")
-        else:
-            cand = next((s for s in xls_alt.sheet_names if "modifier" in s.lower()), xls_alt.sheet_names[0])
-            mod_df = xls_alt.parse(cand)
-    except Exception as e:
-        st.error(f"Failed to read Modifiers from fallback file: {e}")
-        st.stop()
-
-if mod_df is None:
-    st.error("Could not locate 'Modifier Items - Template' in Yoco file or fallback file.")
-    st.stop()
-
-# Optional Digiscale/PLU Listing CSV
-digi_df = None
-if digiscale_file:
-    try:
-        digi_df = read_core_csv(digiscale_file)
-    except Exception as e:
-        st.error(f"Failed to read Digiscale / PLU Listing CSV: {e}")
-        st.stop()
-
-# -------------------------
-# Reconciliations (case-insensitive PLU joins)
-# -------------------------
-# 1) Yoco products vs Core
-yoco_df = yoco_df.copy()
-core_df = core_df.copy()
+# Core/Yoco Recon
 yoco_df["PLU_norm"] = norm_plu_series(yoco_df["Product PLU"])
 core_df["ProductCode_norm"] = norm_plu_series(core_df["ProductCode"])
 
-prod_merge = yoco_df.merge(
-    core_df[["ProductCode", "PriceTier1", "ProductCode_norm"]],
-    left_on="PLU_norm",
-    right_on="ProductCode_norm",
-    how="left"
-)
-
-yoco_not_in_core = (
-    prod_merge[prod_merge["ProductCode"].isna()][["Product PLU", "Name & Variants"]]
-    .rename(columns={"Product PLU": "Product PLU", "Name & Variants": "Name & Variants"})
-)
+prod_merge = yoco_df.merge(core_df, left_on="PLU_norm", right_on="ProductCode_norm", how="left")
+yoco_not_in_core = prod_merge[prod_merge["ProductCode"].isna()][["Product PLU", "Name & Variants"]]
 
 y_price = pd.to_numeric(prod_merge["Selling Price"], errors="coerce")
 c_price = pd.to_numeric(prod_merge["PriceTier1"], errors="coerce")
-has_core_prod = prod_merge["ProductCode"].notna()
-yoco_price_mismatch = (
-    prod_merge.loc[has_core_prod & (y_price.ne(c_price)), ["Product PLU", "Name & Variants", "Selling Price", "PriceTier1"]]
-    .rename(columns={"Selling Price": "Yoco Price", "PriceTier1": "Core Price"})
-)
+yoco_price_mismatch = prod_merge.loc[prod_merge["ProductCode"].notna() & (y_price.ne(c_price)), 
+                                     ["Product PLU", "Name & Variants", "Selling Price", "PriceTier1"]] \
+                                     .rename(columns={"Selling Price": "Yoco Price", "PriceTier1": "Core Price"})
 
-# 2) Core sellable products vs Yoco
 sellable_mask = core_df["Sellable"].astype(str).str.strip().str.lower().eq("yes")
-core_sellable = core_df.loc[sellable_mask, ["ProductCode", "Name", "ProductCode_norm"]]
-core_sellable_merge = core_sellable.merge(
-    yoco_df[["Product PLU", "PLU_norm"]],
-    left_on="ProductCode_norm",
-    right_on="PLU_norm",
-    how="left"
-)
-core_sellable_not_in_yoco = (
-    core_sellable_merge[core_sellable_merge["Product PLU"].isna()][["ProductCode", "Name"]]
-    .rename(columns={"ProductCode": "Core Product Code", "Name": "Core Name"})
-)
+core_sellable_merge = core_df.loc[sellable_mask].merge(yoco_df, left_on="ProductCode_norm", right_on="PLU_norm", how="left")
+core_sellable_not_in_yoco = core_sellable_merge[core_sellable_merge["Product PLU"].isna()][["ProductCode", "Name"]]
 
-# 3) Modifiers not in Core
-mod_code_col = map_first_available(
-    mod_df,
-    candidates=[
-        "modifier items plu product modifier",
-        "modifier items plu",
-        "modifier plu",
-        "product modifier plu",
-        "modifier product plu",
-        "plu",
-    ],
-    require_tokens=["modifier", "plu"]
-) or map_first_available(mod_df, candidates=["plu"])
+# Modifiers
+try:
+    mod_df = read_excel_sheet(yoco_file, "Modifier Items - Template")
+except:
+    mod_df = pd.read_excel(modifiers_alt) if modifiers_alt else None
 
-if not mod_code_col:
-    st.error("Modifiers sheet missing a PLU/code column.")
-    st.stop()
-
-mod_name_col = map_first_available(
-    mod_df, candidates=["modifier name", "name"], require_tokens=["modifier", "name"]
-) or map_first_available(mod_df, candidates=["name"])
-
-mod_type_col = map_first_available(
-    mod_df, candidates=["type products options", "type products options ", "type"]
-)
-
-mod_item_col = map_first_available(
-    mod_df, candidates=["modifier item", "modifier items", "item"], require_tokens=["modifier", "item"]
-) or map_first_available(mod_df, candidates=["item"])
-
-missing_disp = [c for c, v in {
-    "Modifier Name": mod_name_col,
-    "Type (Products / Options)": mod_type_col,
-    "Modifier Item": mod_item_col
-}.items() if not v]
-if missing_disp:
-    st.error(f"Modifiers sheet missing columns: {missing_disp}")
-    st.stop()
-
-_mod = mod_df.copy()
-_mod["_PLU_norm"] = norm_plu_series(_mod[mod_code_col])
-
-_core_codes = core_df[["ProductCode"]].copy()
-_core_codes["_PC_norm"] = norm_plu_series(_core_codes["ProductCode"])
-
-mods_merged = _mod.merge(
-    _core_codes,
-    left_on="_PLU_norm",
-    right_on="_PC_norm",
-    how="left"
-)
-
-mods_not_in_core = mods_merged[mods_merged["ProductCode"].isna()][[mod_name_col, mod_type_col, mod_item_col]].copy()
-mods_not_in_core.columns = ["Modifier Name", "Type (Products / Options)", "Modifier Item"]
-
-# 4) Digiscale (optional) — PLU and price checks
-if digi_df is not None and not digi_df.empty:
-    need_digi = {"PLU #", "Description Line 1", "Price"}
-    missing_digi = need_digi - set(digi_df.columns)
-    if missing_digi:
-        st.error(f"Digiscale/PLU Listing CSV missing columns: {missing_digi}")
-        st.stop()
-
-    digi = digi_df.copy()
-    digi["_PLU_norm"] = norm_plu_series(digi["PLU #"])
-
-    core_map = core_df[["ProductCode", "PriceTier1"]].copy()
-    core_map["_PC_norm"] = norm_plu_series(core_map["ProductCode"])
-
-    digi_merged = digi.merge(
-        core_map[["ProductCode", "PriceTier1", "_PC_norm"]],
-        left_on="_PLU_norm",
-        right_on="_PC_norm",
-        how="left"
-    )
-
-    digi_not_in_core = (
-        digi_merged[digi_merged["ProductCode"].isna()][["PLU #", "Description Line 1"]]
-        .rename(columns={"PLU #": "Digiscale SKU", "Description Line 1": "Digiscale Name"})
-    )
-
-    d_price = pd.to_numeric(digi_merged["Price"], errors="coerce")
-    c_price2 = pd.to_numeric(digi_merged["PriceTier1"], errors="coerce")
-    has_core_digi = digi_merged["ProductCode"].notna()
-    digi_price_mismatch = (
-        digi_merged.loc[has_core_digi & (d_price.ne(c_price2)), ["PLU #", "Description Line 1", "Price", "PriceTier1"]]
-        .rename(columns={
-            "PLU #": "Digiscale SKU",
-            "Description Line 1": "Digiscale Name",
-            "Price": "Yoco Price",
-            "PriceTier1": "Core Price"
-        })
-    )
+if mod_df is not None:
+    mod_df["_PLU_norm"] = norm_plu_series(mod_df.iloc[:, 0])
+    mods_merged = mod_df.merge(core_df, left_on="_PLU_norm", right_on="ProductCode_norm", how="left")
+    mods_not_in_core = mods_merged[mods_merged["ProductCode"].isna()].iloc[:, :3]
 else:
-    digi_not_in_core = pd.DataFrame(columns=["Digiscale SKU", "Digiscale Name"])
-    digi_price_mismatch = pd.DataFrame(columns=["Digiscale SKU", "Digiscale Name", "Yoco Price", "Core Price"])
+    mods_not_in_core = pd.DataFrame()
+
+# Digiscale
+digi_not_in_core = pd.DataFrame()
+digi_price_mismatch = pd.DataFrame()
+if digiscale_file:
+    digi_df = read_core_csv(digiscale_file)
+    digi_df["_PLU_norm"] = norm_plu_series(digi_df["PLU #"])
+    digi_merged = digi_df.merge(core_df, left_on="_PLU_norm", right_on="ProductCode_norm", how="left")
+    digi_not_in_core = digi_merged[digi_merged["ProductCode"].isna()][["PLU #", "Description Line 1"]]
+    d_p = pd.to_numeric(digi_merged["Price"], errors="coerce")
+    c_p = pd.to_numeric(digi_merged["PriceTier1"], errors="coerce")
+    digi_price_mismatch = digi_merged.loc[digi_merged["ProductCode"].notna() & (d_p.ne(c_p)), 
+                                         ["PLU #", "Description Line 1", "Price", "PriceTier1"]]
 
 # -------------------------
-# Build XLSX in-memory
+# Export Phase 1
 # -------------------------
 ts = datetime.now(TZ).strftime("%Y-%m-%d_%H%M")
 out_xlsx = io.BytesIO()
-
 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-    # Sheets
+    create_readme(writer)
     yoco_not_in_core.to_excel(writer, index=False, sheet_name="Yoco Products - Not in Core")
     yoco_price_mismatch.to_excel(writer, index=False, sheet_name="Yoco Products - Price Mismatch")
     core_sellable_not_in_yoco.to_excel(writer, index=False, sheet_name="Core Sellable - Not in Yoco")
@@ -353,36 +202,85 @@ with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
     digi_not_in_core.to_excel(writer, index=False, sheet_name="Digiscale - Not in Core")
     digi_price_mismatch.to_excel(writer, index=False, sheet_name="Digiscale - Price Mismatch")
 
-    # Style after writing
     wb = writer.book
-    # Yoco/Modifiers (blue)
-    for s in ["Yoco Products - Not in Core", "Yoco Products - Price Mismatch", "Core Sellable - Not in Yoco", "Modifiers - Not in Core"]:
-        if s in wb.sheetnames:
-            style_and_autofit_sheet(wb[s], rgb_hex=PEREGRINE_BLUE)
-    # Digiscale (green)
-    for s in ["Digiscale - Not in Core", "Digiscale - Price Mismatch"]:
-        if s in wb.sheetnames:
-            style_and_autofit_sheet(wb[s], rgb_hex=DIGISCALE_GREEN)
+    for s in wb.sheetnames:
+        if s == "README": continue
+        color = DIGISCALE_GREEN if "Digiscale" in s else PEREGRINE_BLUE
+        style_and_autofit_sheet(wb[s], rgb_hex=color)
 
-# Prepare download
-out_xlsx.seek(0)
-download_name = f"yoco_core_reconciliation_{ts}.xlsx"
-
-st.success("✅ Reconciliation complete.")
+st.success("✅ Reconciliation Complete.")
 st.download_button(
-    label="⬇️ Download Excel",
+    label="⬇️ Download Reconciliation XLSX",
     data=out_xlsx.getvalue(),
-    file_name=download_name,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    file_name=f"recon_report_{ts}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# Quick stats
-with st.expander("Show summary"):
-    st.write({
-        "Yoco Products - Not in Core": len(yoco_not_in_core),
-        "Yoco Products - Price Mismatch": len(yoco_price_mismatch),
-        "Core Sellable - Not in Yoco": len(core_sellable_not_in_yoco),
-        "Modifiers - Not in Core": len(mods_not_in_core),
-        "Digiscale - Not in Core": len(digi_not_in_core),
-        "Digiscale - Price Mismatch": len(digi_price_mismatch),
-    })
+# -------------------------
+# Phase 2: Monthly Health Check
+# -------------------------
+st.divider()
+st.subheader("🔍 Phase 2: Monthly Health Check")
+st.caption("Upload the pre-filtered analysis file with 5 sheets.")
+health_file = st.file_uploader("Upload Health Check XLSX:", type=["xlsx"])
+
+if health_file:
+    try:
+        # Load sheets
+        df_dupes = pd.read_excel(health_file, sheet_name="Duplicate Sales")
+        df_margin = pd.read_excel(health_file, sheet_name="Assembly BOM vs Margin Check")
+        df_stock = pd.read_excel(health_file, sheet_name="Stock Adjustment Analysis")
+        df_bom = pd.read_excel(health_file, sheet_name="Deleted BOM Lines Check")
+
+        # Counts & Logic
+        dupe_count = len(df_dupes)
+        stock_issues = df_stock[df_stock["Unit Cost"].isin([0, 1])]
+        bom_issues = df_bom[df_bom["Status"].astype(str).str.contains("❌ MISSING", na=False)]
+        
+        # Margin sorting
+        low_margin = df_margin.sort_values("GP Margin").head(5)[["ProductSKU", "ProductName", "GP Margin"]]
+        high_margin = df_margin.sort_values("GP Margin", ascending=False).head(5)[["ProductSKU", "ProductName", "GP Margin"]]
+
+        # Display Metrics
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Duplicate Sales", f"{dupe_count} rows")
+        c2.metric("R0/R1 Stock Adjusts", f"{len(stock_issues)} items")
+        c3.metric("BOM Missing Lines", f"{len(bom_issues)} assemblies")
+
+        # Margin Tables
+        st.write("### 📊 Margin Highlights")
+        m_col1, m_col2 = st.columns(2)
+        with m_col1:
+            st.write("**Bottom 5 (Lowest)**")
+            st.dataframe(low_margin, hide_index=True)
+        with m_col2:
+            st.write("**Top 5 (Highest)**")
+            st.dataframe(high_margin, hide_index=True)
+
+        # --- Email Summary Generation ---
+        st.divider()
+        st.subheader("✉️ Email Summary")
+        email_body = f"""Hi Team,
+
+Please find the reconciliation and health check summary for the period:
+
+RECONCILIATION SUMMARY:
+- Yoco Items not in Core: {len(yoco_not_in_core)}
+- Price Mismatches (Yoco vs Core): {len(yoco_price_mismatch)}
+- Missing from Yoco (Sellable in Core): {len(core_sellable_not_in_yoco)}
+- Digiscale Price Mismatches: {len(digi_price_mismatch)}
+
+MONTHLY HEALTH CHECK:
+- Duplicate Sales: {dupe_count} rows found.
+- Stock Adjustments: {len(stock_issues)} items adjusted at R0 or R1.
+- BOM Integrity: {len(bom_issues)} assemblies found with missing BOM lines.
+- Lowest Margin Item: {low_margin.iloc[0]['ProductName'] if not low_margin.empty else 'N/A'} ({low_margin.iloc[0]['GP Margin'] if not low_margin.empty else '0'}%)
+
+Please refer to the attached reports for the full details.
+
+Best regards,"""
+
+        st.text_area("Copy and paste this summary into your email body:", value=email_body, height=380)
+
+    except Exception as e:
+        st.error(f"Error processing health check file: {e}")
