@@ -105,7 +105,7 @@ def norm_plu_series(s):
 # -------------------------
 # UI: File Upload
 # -------------------------
-st.title("🧾 systems Reconciliation | Cin7 Report Summary")
+st.title("🧾 Systems Reconciliation | Cin7 Report Summary")
 st.caption("BULK sheet + Modifiers + Digiscale checks → one XLSX download")
 
 with st.form("inputs"):
