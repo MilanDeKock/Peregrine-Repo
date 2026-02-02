@@ -63,7 +63,7 @@ def create_readme(writer):
         ["Yoco Products - Not in Core", "Items found in Yoco but missing from Core. Action: Add to Core or fix SKU."],
         ["Yoco Products - Price Mismatch", "Selling prices don't match. Action: Sync prices between systems."],
         ["Core Sellable - Not in Yoco", "Items marked 'Sellable' in Core but missing from Yoco. Action: Add to Yoco."],
-        ["Modifiers - Not in Core", "Modifier items missing from Core. Action: Ensure all modifiers have Core PLUs."],
+        ["Modifiers - Not in Core", "Modifier items not found in Core. Action: Ensure all modifiers listed shoudl be of type Option. If not, amend it in Yoco accordingly."],
         ["Digiscale - Not in Core", "Items on the Digiscale list not found in Core. Action: Update Core inventory."],
         ["Digiscale - Price Mismatch", "Scale prices vs Core prices. Action: Update scale pricing."]
     ]
