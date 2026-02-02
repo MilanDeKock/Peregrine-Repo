@@ -315,7 +315,7 @@ Cin7 Report Summary:
 
 Please refer to the attached reports for the full details.
 
-Best regards,"""
+"""
 
         # UI for Subject and Body
         st.text_input("Email Subject:", value=subject_line)
