@@ -246,19 +246,45 @@ if health_file:
         df_stock = pd.read_excel(health_file, sheet_name="Stock Adjustment Analysis")
         df_bom = pd.read_excel(health_file, sheet_name="Deleted BOM Lines Check")
 
+        # --- 1. Duplicate Sales ---
         dupe_count = len(df_dupes)
-        stock_issues = df_stock[df_stock["Unit Cost"].isin([0, 1])]
-        bom_issues = df_bom[df_bom["Status"].astype(str).str.contains("❌ MISSING", na=False)]
-        low_margin = df_margin.sort_values("GP Margin").head(5)
+
+        # --- 2. Margin Analysis (Handling 45.28% vs 0.4528) ---
+        # Convert to numeric, errors to NaN
+        m_vals = pd.to_numeric(df_margin["GP Margin"], errors='coerce')
         
+        # If the max value is <= 1.0, it's likely decimal (0.45), so multiply by 100
+        # If it's already > 1.0, we treat it as literal percentage (45.28)
+        if m_vals.max() <= 1.0:
+            m_vals = m_vals * 100
+        
+        df_margin["GP_Clean"] = m_vals
+        
+        neg_margin_count = len(df_margin[df_margin["GP_Clean"] < 0])
+        high_margin_count = len(df_margin[df_margin["GP_Clean"] > 80])
+        low_margin_df = df_margin.sort_values("GP_Clean").head(5)
+
+        # --- 3. Stock Adjustments ---
+        stock_issues = df_stock[df_stock["Unit Cost"].isin([0, 1])]
+
+        # --- 4. Production Integrity ---
+        bom_issues = df_bom[df_bom["Status"].astype(str).str.contains("❌ MISSING", na=False)]
+
+        # --- Metrics Display ---
         c1, c2, c3 = st.columns(3)
         c1.metric("Duplicate Sales", f"{dupe_count}")
         c2.metric("R0/R1 Stock Adj", f"{len(stock_issues)}")
         c3.metric("BOM Missing Lines", f"{len(bom_issues)}")
 
-        st.write("### 📉 Lowest Margins")
-        st.dataframe(low_margin[["ProductSKU", "ProductName", "GP Margin"]].head(5), hide_index=True)
+        st.write("### 📊 Margin Breakdown")
+        m1, m2 = st.columns(2)
+        m1.info(f"🚩 **{neg_margin_count}** items have a Negative Margin.")
+        m2.success(f"💎 **{high_margin_count}** items have a Margin > 80%.")
 
+        st.write("**Bottom 5 Margins**")
+        st.dataframe(low_margin_df[["ProductSKU", "ProductName", "GP_Clean"]].rename(columns={"GP_Clean": "GP Margin %"}), hide_index=True)
+
+        # --- Updated Email Summary ---
         st.subheader("✉️ Email Summary")
         email_body = f"""Hi Team,
 
@@ -276,12 +302,13 @@ Cin7 Report Summary:
 - Duplicate Sales: {dupe_count} rows found.
 - Stock Adjustments: {len(stock_issues)} items adjusted at R0 or R1.
 - Production Integrity: {len(bom_issues)} assemblies found with missing BOM lines.
-- Lowest Margin Item: {low_margin.iloc[0]['ProductName'] if not low_margin.empty else 'N/A'} ({low_margin.iloc[0]['GP Margin'] if not low_margin.empty else '0'}%)
+- Margin Health: {neg_margin_count} items with negative margins and {high_margin_count} items above 80%.
+- Lowest Margin Item: {low_margin_df.iloc[0]['ProductName'] if not low_margin_df.empty else 'N/A'} ({low_margin_df.iloc[0]['GP_Clean']:.2f}% if not low_margin_df.empty else '0'%)
 
 Please refer to the attached reports for the full details.
 
 Best regards,"""
-        st.text_area("Copy/Paste into Email:", value=email_body, height=450)
+        st.text_area("Copy/Paste into Email:", value=email_body, height=480)
 
     except Exception as e:
         st.error(f"Error in Phase 2: {e}")
