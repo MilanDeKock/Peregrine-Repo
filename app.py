@@ -220,7 +220,7 @@ with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
         style_and_autofit_sheet(wb[s], rgb_hex=color)
 
 st.success("✅ Phase 1 Complete.")
-st.download_button("⬇️ Download Recon XLSX", data=out_xlsx.getvalue(), file_name=f"recon_{datetime.now(TZ).strftime('%Y%m%d')}.xlsx")
+st.download_button("⬇️ Download Recon XLSX", data=out_xlsx.getvalue(), file_name=f"core_yoco_digiscale_recon_{datetime.now(TZ).strftime('%Y%m%d')}.xlsx")
 
 with st.expander("Show recon summary"):
     st.write({
