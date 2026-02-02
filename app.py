@@ -16,7 +16,7 @@ PEREGRINE_BLUE = "00A9E0"   # RGB(0,169,224)
 DIGISCALE_GREEN = "3E5D3E"  # RGB(62,93,62)
 README_RED = "FF0000"       # RGB(255,0,0)
 
-st.set_page_config(page_title="Core | Yoco | Digiscale Reconciliation", page_icon="🧾", layout="centered")
+st.set_page_config(page_title="Core | Yoco | Digiscale Reconciliation | Cin7 Check Summary ", page_icon="🧾", layout="centered")
 
 st.markdown(
     """
@@ -162,18 +162,24 @@ sellable_mask = core_df["Sellable"].astype(str).str.strip().str.lower().eq("yes"
 core_sellable_merge = core_df.loc[sellable_mask].merge(yoco_df, left_on="ProductCode_norm", right_on="PLU_norm", how="left")
 core_sellable_not_in_yoco = core_sellable_merge[core_sellable_merge["Product PLU"].isna()][["ProductCode", "Name"]]
 
-# Modifiers
+# --- Modifiers ---
 try:
+    # This specifically looks for the "Modifier Items - Template" sheet in the Yoco file
     mod_df = read_excel_sheet(yoco_file, "Modifier Items - Template")
-except:
-    mod_df = pd.read_excel(modifiers_alt) if modifiers_alt else None
+except Exception:
+    # If not found in Yoco file, it tries the separate modifiers_alt upload
+    if modifiers_alt:
+        try:
+            mod_df = pd.read_excel(modifiers_alt, sheet_name="Modifier Items - Template")
+        except:
+            # Final fallback: just read the first sheet of the modifier file
+            mod_df = pd.read_excel(modifiers_alt)
+    else:
+        mod_df = None
 
 if mod_df is not None:
+    # Rest of your modifier logic...
     mod_df["_PLU_norm"] = norm_plu_series(mod_df.iloc[:, 0])
-    mods_merged = mod_df.merge(core_df, left_on="_PLU_norm", right_on="ProductCode_norm", how="left")
-    mods_not_in_core = mods_merged[mods_merged["ProductCode"].isna()].iloc[:, :3]
-else:
-    mods_not_in_core = pd.DataFrame()
 
 # Digiscale
 digi_not_in_core = pd.DataFrame()
@@ -264,18 +270,19 @@ if health_file:
 
 Please find the reconciliation and health check summary for the period:
 
-RECONCILIATION SUMMARY:
+Yoco|Core|Digiscale Reconciliation Summary:
 - Yoco Items not in Core: {len(yoco_not_in_core)}
 - Price Mismatches (Yoco vs Core): {len(yoco_price_mismatch)}
 - Missing from Yoco (Sellable in Core): {len(core_sellable_not_in_yoco)}
+- Modifiers not in Core (ensure all the items present should be type Option and not need a PLU): {len(mods_not_in_core)}
+- Digiscale Items not in Core: {len(digi_not_in_core)}
 - Digiscale Price Mismatches: {len(digi_price_mismatch)}
 
-MONTHLY HEALTH CHECK:
+Cin7 Report Summary:
 - Duplicate Sales: {dupe_count} rows found.
 - Stock Adjustments: {len(stock_issues)} items adjusted at R0 or R1.
-- BOM Integrity: {len(bom_issues)} assemblies found with missing BOM lines.
+- Production Integrity: {len(bom_issues)} assemblies found with missing BOM lines.
 - Lowest Margin Item: {low_margin.iloc[0]['ProductName'] if not low_margin.empty else 'N/A'} ({low_margin.iloc[0]['GP Margin'] if not low_margin.empty else '0'}%)
-
 Please refer to the attached reports for the full details.
 
 Best regards,"""
