@@ -286,6 +286,10 @@ if health_file:
 
         # --- Updated Email Summary ---
         st.subheader("✉️ Email Summary")
+        
+        # Calculate summary strings for the email
+        margin_summary = f"{neg_margin_count} items identified with negative margins and {high_margin_count} items with margins above 80%."
+        
         email_body = f"""Hi Team,
 
 Please find the reconciliation and health check summary for the period:
@@ -302,13 +306,13 @@ Cin7 Report Summary:
 - Duplicate Sales: {dupe_count} rows found.
 - Stock Adjustments: {len(stock_issues)} items adjusted at R0 or R1.
 - Production Integrity: {len(bom_issues)} assemblies found with missing BOM lines.
-- Margin Health: {neg_margin_count} items with negative margins and {high_margin_count} items above 80%.
-- Lowest Margin Item: {low_margin_df.iloc[0]['ProductName'] if not low_margin_df.empty else 'N/A'} ({low_margin_df.iloc[0]['GP_Clean']:.2f}% if not low_margin_df.empty else '0'%)
+- Margin Analysis: {margin_summary}
 
 Please refer to the attached reports for the full details.
 
 Best regards,"""
-        st.text_area("Copy/Paste into Email:", value=email_body, height=480)
 
+        st.text_area("Copy and paste this summary into your email body:", value=email_body, height=450)
+        
     except Exception as e:
         st.error(f"Error in Phase 2: {e}")
