@@ -1,4 +1,10 @@
 streamlit
 pandas
+numpy
 openpyxl
 pytz
+pdfplumber
+camelot-py[cv]
+opencv-python-headless
+requests
+python-dotenv
