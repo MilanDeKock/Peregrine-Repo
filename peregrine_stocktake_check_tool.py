@@ -4,7 +4,7 @@ import re
 import tempfile
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -28,12 +28,12 @@ CALL_INTERVAL = 60.0 / CALLS_PER_MINUTE
 
 st.set_page_config(
     page_title="Peregrine Stocktake Check Tool",
-    page_icon="📦",
+    page_icon="\U0001F4E6",
     layout="wide",
 )
 
-st.title("📦 Peregrine Stocktake Check Tool")
-st.caption("Upload a Stocktake PDF → Inventory pulled from Cin7 Core → Variance Analysis XLSX download")
+st.title("\U0001F4E6 Peregrine Stocktake Check Tool")
+st.caption("Upload a Stocktake PDF \u2192 Inventory pulled from Cin7 Core \u2192 Variance Analysis XLSX download")
 
 
 # -------------------------
@@ -59,12 +59,14 @@ class Cin7Client:
     def get(self, endpoint, params=None):
         self._throttle()
         url = f"{API_BASE_URL}/{endpoint}"
-        resp = requests.get(url, headers=self.headers, params=params, timeout=30)
-        if resp.status_code == 503:
-            # Rate limited — wait and retry once
-            time.sleep(60)
-            self._last_call_time = time.time()
+        for attempt in range(3):
             resp = requests.get(url, headers=self.headers, params=params, timeout=30)
+            if resp.status_code in (429, 503):
+                # Rate limited — back off and retry
+                time.sleep(60)
+                self._last_call_time = time.time()
+                continue
+            break
         resp.raise_for_status()
         return resp.json()
 
@@ -116,24 +118,67 @@ def fetch_inventory_from_api(account_id, api_key):
     return pd.DataFrame(rows)
 
 
-def fetch_availability_by_sku(client, sku):
-    """GET /ref/productavailability — SOH per location for a SKU."""
-    try:
-        data = client.get("ref/productavailability", params={"Sku": sku})
-    except requests.HTTPError:
-        return []
-    if data and data.get("ProductAvailabilityList"):
-        return [
-            row for row in data["ProductAvailabilityList"]
-            if row.get("SKU", "").strip().upper() == sku.strip().upper()
-        ]
-    return []
+# -------------------------
+# Bulk Reference Data Fetchers
+# -------------------------
+def fetch_all_soh(client, progress_cb=None):
+    """
+    Fetch SOH for ALL products by paginating /ref/productavailability
+    without a SKU filter. Returns dict keyed by SKU (upper).
+    """
+    soh_data = {}
+    page = 1
+    limit = 1000
+    total_fetched = 0
+
+    while True:
+        try:
+            data = client.get("ref/productavailability", params={
+                "Page": page, "Limit": limit,
+            })
+        except requests.HTTPError:
+            break
+        rows = data.get("ProductAvailabilityList", [])
+        if not rows:
+            break
+
+        # Group rows by SKU
+        for row in rows:
+            sku_key = (row.get("SKU") or "").strip().upper()
+            if not sku_key:
+                continue
+            if sku_key not in soh_data:
+                soh_data[sku_key] = {
+                    "SOH_Total_OnHand": 0,
+                    "SOH_Total_Available": 0,
+                    "locations": [],
+                }
+            oh = row.get("OnHand", 0) or 0
+            av = row.get("Available", 0) or 0
+            loc = row.get("Location", "?")
+            soh_data[sku_key]["SOH_Total_OnHand"] += oh
+            soh_data[sku_key]["SOH_Total_Available"] += av
+            soh_data[sku_key]["locations"].append(f"{loc}: {oh}")
+
+        total_fetched += len(rows)
+        total = data.get("Total", 0)
+        if progress_cb:
+            progress_cb(total_fetched, total)
+        if page * limit >= total:
+            break
+        page += 1
+
+    # Flatten location lists into strings
+    for sku_key, entry in soh_data.items():
+        entry["SOH_Per_Location"] = " | ".join(entry.pop("locations"))
+
+    return soh_data
 
 
-def fetch_bom_reverse_index(client):
+def fetch_bom_reverse_index(client, progress_cb=None):
     """
     Fetch ALL products with BOM data and build a reverse index:
-    component SKU → list of parent products that use it.
+    component SKU -> list of parent products that use it.
     """
     bom_index = defaultdict(list)
     page = 1
@@ -159,9 +204,10 @@ def fetch_bom_reverse_index(client):
                             "ParentName": parent_name,
                             "Quantity": comp.get("Quantity", 0),
                             "QuantityToProduce": p.get("QuantityToProduce", 1),
-                            "WastagePercent": comp.get("WastagePercent", 0),
                         })
         total = data.get("Total", 0)
+        if progress_cb:
+            progress_cb(page * limit, total)
         if page * limit >= total:
             break
         page += 1
@@ -169,11 +215,13 @@ def fetch_bom_reverse_index(client):
     return bom_index
 
 
-def fetch_recent_stock_takes(client, limit=5):
+def fetch_all_stock_take_lines(client, progress_cb=None, num_takes=5):
     """
-    GET /stockTakeList — fetch all completed stock takes with pagination,
-    sort by EffectiveDate descending, and return the most recent `limit`.
+    Fetch last N completed stock takes and store ALL line items
+    in a dict keyed by SKU (upper). Each SKU gets data from its
+    most recent stock take only.
     """
+    # Fetch stock take list
     all_takes = []
     page = 1
     page_size = 100
@@ -192,7 +240,6 @@ def fetch_recent_stock_takes(client, limit=5):
             break
         page += 1
 
-    # Parse dates properly for reliable sorting (most recent first)
     def parse_date(st_entry):
         raw = st_entry.get("EffectiveDate", "") or ""
         try:
@@ -201,231 +248,23 @@ def fetch_recent_stock_takes(client, limit=5):
             return datetime.min
 
     all_takes.sort(key=parse_date, reverse=True)
-    return all_takes[:limit]
+    recent_takes = all_takes[:num_takes]
 
-
-def fetch_stock_take_detail(client, task_id):
-    """GET /stocktake?TaskID=... — full detail of a stock take."""
-    try:
-        return client.get("stocktake", params={"TaskID": task_id})
-    except requests.HTTPError:
-        return None
-
-
-def fetch_latest_po_receiving(client, skus, progress_cb=None,
-                              max_po_details=50, months_back=6):
-    """
-    Fetch recent received POs (last N months) and find the latest receiving per SKU.
-    Only fetches POs updated in the lookback window to avoid scanning all history.
-    Returns (receiving_data, debug_info).
-    """
-    from datetime import timedelta
-
-    sku_set = {s.upper() for s in skus}
-    receiving_data = {}
-    debug = {
-        "total_po_list": 0, "received_po_count": 0, "details_checked": 0,
-        "total_lines_found": 0, "skus_matched": 0, "statuses_seen": {},
-        "sample_po": None, "sample_detail_keys": None,
-        "sample_stock_received_type": None, "sample_line_keys": None,
-        "errors": [],
-    }
-
-    # Only look at POs updated in the last N months
-    since = (datetime.now() - timedelta(days=30 * months_back)).strftime("%Y-%m-%dT00:00:00")
-
-    # --- Phase 1: Fetch recent purchase list entries ---
-    all_purchases = []
-    page = 1
-    while True:
-        try:
-            data = client.get("purchaseList", params={
-                "Page": page, "Limit": 100, "UpdatedSince": since,
-            })
-        except requests.HTTPError as e:
-            debug["errors"].append(f"purchaseList page {page}: {e}")
-            break
-        purchases = data.get("PurchaseList", [])
-        all_purchases.extend(purchases)
-        total = data.get("Total", 0)
-        if page * 100 >= total:
-            break
-        page += 1
-
-    debug["total_po_list"] = len(all_purchases)
-
-    for po in all_purchases:
-        status = po.get("CombinedReceivingStatus") or "(empty)"
-        debug["statuses_seen"][status] = debug["statuses_seen"].get(status, 0) + 1
-
-    if all_purchases:
-        debug["sample_po"] = {
-            k: str(v)[:80] for k, v in list(all_purchases[0].items())[:12]
-        }
-
-    # --- Phase 2: Filter for received POs, sort newest first ---
-    received_pos = [
-        po for po in all_purchases
-        if (po.get("CombinedReceivingStatus") or "").upper()
-        not in ("NOT RECEIVED", "NOT AVAILABLE", "VOIDED", "")
-    ]
-    debug["received_po_count"] = len(received_pos)
-
-    def parse_po_date(po):
-        raw = po.get("OrderDate", "") or ""
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            return datetime.min
-
-    received_pos.sort(key=parse_po_date, reverse=True)
-
-    # --- Phase 3: Fetch stock detail for newest POs first ---
-    details_checked = 0
-    for po in received_pos:
-        if details_checked >= max_po_details:
-            break
-        if len(receiving_data) >= len(sku_set):
-            break
-
-        po_id = po.get("ID")
-        po_number = po.get("OrderNumber", "")
-
-        lines = []
-
-        # Try advanced purchase detail
-        try:
-            detail = client.get("advanced-purchase", params={"ID": po_id})
-            if debug["sample_detail_keys"] is None:
-                debug["sample_detail_keys"] = list(detail.keys())
-            stock_received = detail.get("StockReceived", [])
-            if debug["sample_stock_received_type"] is None:
-                debug["sample_stock_received_type"] = (
-                    f"{type(stock_received).__name__}, "
-                    f"len={len(stock_received) if isinstance(stock_received, list) else 'N/A'}"
-                )
-            if isinstance(stock_received, list):
-                for sr in stock_received:
-                    lines.extend(sr.get("Lines", []))
-            elif isinstance(stock_received, dict):
-                lines.extend(stock_received.get("Lines", []))
-        except requests.HTTPError as e:
-            debug["errors"].append(f"advanced-purchase {po_number}: {e}")
-
-        # Fallback: simple purchase detail
-        if not lines:
-            try:
-                detail = client.get("purchase", params={"ID": po_id})
-                if debug["sample_detail_keys"] is None:
-                    debug["sample_detail_keys"] = list(detail.keys())
-                stock_received = detail.get("StockReceived", {})
-                if debug["sample_stock_received_type"] is None:
-                    debug["sample_stock_received_type"] = type(stock_received).__name__
-                if isinstance(stock_received, dict):
-                    lines.extend(stock_received.get("Lines", []))
-                elif isinstance(stock_received, list):
-                    for sr in stock_received:
-                        lines.extend(sr.get("Lines", []))
-            except requests.HTTPError as e:
-                debug["errors"].append(f"purchase {po_number}: {e}")
-
-        if lines and debug["sample_line_keys"] is None:
-            debug["sample_line_keys"] = list(lines[0].keys())
-
-        debug["total_lines_found"] += len(lines)
-
-        for line in lines:
-            sku_key = (line.get("SKU") or "").strip().upper()
-            if sku_key in sku_set and sku_key not in receiving_data:
-                receiving_data[sku_key] = {
-                    "Last_PO_Number": po_number,
-                    "Last_PO_Date": (line.get("Date") or "")[:10],
-                    "Last_PO_Qty": line.get("Quantity", 0) or 0,
-                    "Last_PO_Location": line.get("Location") or "",
-                }
-
-        details_checked += 1
-        if progress_cb:
-            progress_cb(details_checked)
-
-    debug["details_checked"] = details_checked
-    debug["skus_matched"] = len(receiving_data)
-
-    return receiving_data, debug
-
-
-# -------------------------
-# Investigation Enrichment
-# -------------------------
-def run_investigation(client, skus, progress_bar, status_text,
-                      sku_descriptions=None, sku_costs=None):
-    """
-    Enrich SKUs with SOH per location, last stock take count, latest PO receiving,
-    and BOM reverse lookup.
-    Returns (df_investigation, df_bom):
-      - df_investigation: one row per SKU with SOH, stock take, and PO data
-      - df_bom: exploded — one row per SKU per parent BOM it belongs to
-    """
-    if sku_descriptions is None:
-        sku_descriptions = {}
-    if sku_costs is None:
-        sku_costs = {}
-    # SOH per SKU + BOM bulk (~3) + stock takes (~6) + PO receiving (~30)
-    total_steps = len(skus) + 40
-    step = 0
-
-    # --- Step 1: SOH per location ---
-    status_text.text("Fetching stock on hand per location...")
-    soh_data = {}
-    for sku in skus:
-        avail = fetch_availability_by_sku(client, sku)
-        if avail:
-            loc_parts = []
-            total_on_hand = 0
-            total_available = 0
-            for row in avail:
-                loc = row.get("Location", "?")
-                oh = row.get("OnHand", 0) or 0
-                av = row.get("Available", 0) or 0
-                loc_parts.append(f"{loc}: {oh}")
-                total_on_hand += oh
-                total_available += av
-            soh_data[sku.upper()] = {
-                "SOH_Total_OnHand": total_on_hand,
-                "SOH_Total_Available": total_available,
-                "SOH_Per_Location": " | ".join(loc_parts),
-            }
-        else:
-            soh_data[sku.upper()] = {
-                "SOH_Total_OnHand": None,
-                "SOH_Total_Available": None,
-                "SOH_Per_Location": "NOT FOUND",
-            }
-        step += 1
-        progress_bar.progress(step / total_steps, text=f"SOH: {step}/{len(skus)} SKUs")
-
-    # --- Step 2: BOM reverse index (bulk fetch all products) ---
-    status_text.text("Building BOM reverse index (fetching all products)...")
-    bom_index = fetch_bom_reverse_index(client)
-    step += 3
-    progress_bar.progress(min(step / total_steps, 0.95), text="BOM index built")
-
-    # --- Step 3: Last stock take counts ---
-    status_text.text("Fetching last stock take counts...")
+    # Fetch detail for each and aggregate ALL lines
     last_count = {}
-    stock_takes = fetch_recent_stock_takes(client, limit=5)
-    step += 1
-    progress_bar.progress(step / total_steps)
-
-    for st_entry in stock_takes:
+    for i, st_entry in enumerate(recent_takes):
         task_id = st_entry.get("TaskID")
         st_number = st_entry.get("StocktakeNumber", "?")
         st_date = st_entry.get("EffectiveDate", "")[:10]
         st_location = st_entry.get("Location", "")
 
-        detail = fetch_stock_take_detail(client, task_id)
-        step += 1
-        progress_bar.progress(min(step / total_steps, 0.95))
+        try:
+            detail = client.get("stocktake", params={"TaskID": task_id})
+        except requests.HTTPError:
+            detail = None
+
+        if progress_cb:
+            progress_cb(i + 1, len(recent_takes))
 
         if not detail:
             continue
@@ -456,25 +295,151 @@ def run_investigation(client, skus, progress_bar, status_text,
                     "Last_StockTake_Location": st_location,
                 }
 
-    # --- Step 4: Latest PO receiving ---
-    status_text.text("Fetching latest PO receiving data...")
-    def po_progress(n):
-        nonlocal step
-        step += 1
-        progress_bar.progress(min(step / total_steps, 0.99),
-                              text=f"PO receiving: checked {n} POs")
+    return last_count
 
-    po_data, po_debug = fetch_latest_po_receiving(client, skus, progress_cb=po_progress)
 
-    progress_bar.progress(1.0)
-    status_text.text("Building investigation tables...")
+def fetch_po_data_via_movements(client, skus, progress_cb=None):
+    """
+    Fetch latest PO receiving for given SKUs using the Product Movements API.
+    One call per SKU: GET /product?Sku={SKU}&IncludeMovements=true
+    Filters movements for Type 'Purchase' or 'Advanced Purchase',
+    picks the most recent one.
+    Returns (receiving_data, debug_info).
+    """
+    receiving_data = {}
+    debug = {
+        "skus_queried": 0, "skus_with_po": 0,
+        "total_movements_seen": 0,
+        "errors": [],
+    }
 
-    # --- Build investigation DataFrame (SOH + stock take + PO) ---
+    purchase_types = {"purchase", "advanced purchase"}
+
+    for i, sku in enumerate(skus):
+        try:
+            data = client.get("product", params={
+                "Sku": sku, "IncludeMovements": "true",
+            })
+        except requests.HTTPError as e:
+            debug["errors"].append(f"product?Sku={sku}: {e}")
+            debug["skus_queried"] += 1
+            if progress_cb:
+                progress_cb(i + 1, len(skus))
+            continue
+
+        products = data.get("Products", [])
+        if not products:
+            debug["skus_queried"] += 1
+            if progress_cb:
+                progress_cb(i + 1, len(skus))
+            continue
+
+        movements = products[0].get("Movements", [])
+        debug["total_movements_seen"] += len(movements)
+
+        # Filter for purchase movements only
+        po_movements = [
+            m for m in movements
+            if (m.get("Type") or "").lower() in purchase_types
+        ]
+
+        if po_movements:
+            # Sort by date descending to get latest
+            def parse_date(m):
+                raw = (m.get("Date") or "")[:19]
+                try:
+                    return datetime.fromisoformat(raw)
+                except (ValueError, TypeError):
+                    return datetime.min
+
+            po_movements.sort(key=parse_date, reverse=True)
+            latest = po_movements[0]
+            receiving_data[sku.upper()] = {
+                "Last_PO_Number": latest.get("Number", ""),
+                "Last_PO_Date": (latest.get("Date") or "")[:10],
+                "Last_PO_Qty": latest.get("Quantity", 0) or 0,
+                "Last_PO_Location": latest.get("Location") or "",
+            }
+            debug["skus_with_po"] += 1
+
+        debug["skus_queried"] += 1
+        if progress_cb:
+            progress_cb(i + 1, len(skus))
+
+    return receiving_data, debug
+
+
+# -------------------------
+# Reference Data Loader
+# -------------------------
+def load_reference_data(client, progress_bar, status_text):
+    """
+    Orchestrate bulk fetch of reference data (SOH, BOM, stock takes).
+    Returns dict with all pre-loaded data.
+    """
+    # Phase 1: SOH (0% - 35%)
+    status_text.text("Loading SOH for all products...")
+    def soh_progress(fetched, total):
+        pct = min(0.35 * (fetched / max(total, 1)), 0.34)
+        progress_bar.progress(pct, text=f"SOH: {fetched:,} / {total:,} rows")
+
+    soh_data = fetch_all_soh(client, progress_cb=soh_progress)
+    progress_bar.progress(0.35, text=f"SOH loaded: {len(soh_data):,} SKUs")
+
+    # Phase 2: BOM (35% - 65%)
+    status_text.text("Building BOM reverse index...")
+    def bom_progress(fetched, total):
+        pct = 0.35 + min(0.30 * (fetched / max(total, 1)), 0.29)
+        progress_bar.progress(pct, text="BOM: fetching products...")
+
+    bom_index = fetch_bom_reverse_index(client, progress_cb=bom_progress)
+    progress_bar.progress(0.65, text=f"BOM loaded: {len(bom_index):,} components")
+
+    # Phase 3: Stock takes (65% - 100%)
+    status_text.text("Fetching stock take history...")
+    def st_progress(done, total):
+        pct = 0.65 + min(0.35 * (done / max(total, 1)), 0.34)
+        progress_bar.progress(pct, text=f"Stock takes: {done}/{total} details")
+
+    stock_take_data = fetch_all_stock_take_lines(client, progress_cb=st_progress)
+    progress_bar.progress(1.0, text="Reference data loaded.")
+
+    return {
+        "soh_data": soh_data,
+        "bom_index": bom_index,
+        "stock_take_data": stock_take_data,
+        "loaded_at": datetime.now(TZ).strftime("%H:%M:%S"),
+    }
+
+
+# -------------------------
+# Investigation Builder (no API calls)
+# -------------------------
+def build_investigation_from_ref(ref_data, skus, sku_descriptions=None,
+                                 sku_costs=None, po_data=None):
+    """
+    Build investigation + BOM DataFrames from pre-loaded reference data.
+    Pure filtering — no API calls.
+    PO data is optional (fetched separately on-demand).
+    Returns (df_investigation, df_bom).
+    """
+    if sku_descriptions is None:
+        sku_descriptions = {}
+    if sku_costs is None:
+        sku_costs = {}
+    if po_data is None:
+        po_data = {}
+
+    soh_data = ref_data["soh_data"]
+    bom_index = ref_data["bom_index"]
+    stock_take_data = ref_data["stock_take_data"]
+
+    # Build investigation DataFrame (SOH + stock take + PO)
     inv_rows = []
     for sku in skus:
         key = sku.upper()
         soh = soh_data.get(key, {})
-        lc = last_count.get(key, {})
+        lc = stock_take_data.get(key, {})
         po = po_data.get(key, {})
         avg_cost = sku_costs.get(sku, 0) or 0
 
@@ -488,7 +453,7 @@ def run_investigation(client, skus, progress_bar, status_text,
             "AverageCost": avg_cost,
             "SOH_Total_OnHand": soh.get("SOH_Total_OnHand"),
             "SOH_Total_Available": soh.get("SOH_Total_Available"),
-            "SOH_Per_Location": soh.get("SOH_Per_Location", ""),
+            "SOH_Per_Location": soh.get("SOH_Per_Location", "NOT FOUND"),
             "Last_StockTake_Ref": lc.get("Last_StockTake_Ref", ""),
             "Last_StockTake_Date": lc.get("Last_StockTake_Date", ""),
             "Last_StockTake_Location": lc.get("Last_StockTake_Location", ""),
@@ -504,7 +469,7 @@ def run_investigation(client, skus, progress_bar, status_text,
 
     df_investigation = pd.DataFrame(inv_rows)
 
-    # --- Build BOM DataFrame (exploded: one row per SKU per parent) ---
+    # Build BOM DataFrame (exploded: one row per SKU per parent)
     bom_rows = []
     for sku in skus:
         key = sku.upper()
@@ -524,7 +489,7 @@ def run_investigation(client, skus, progress_bar, status_text,
                  "Qty_In_BOM", "Qty_To_Produce"]
     )
 
-    return df_investigation, df_bom, po_debug
+    return df_investigation, df_bom
 
 
 # -------------------------
@@ -790,7 +755,6 @@ def build_excel(df_refined, df_merged, df_investigation=None, df_bom=None):
 
         # --- Sheet 2: Investigation ---
         if df_investigation is not None and not df_investigation.empty:
-            # Drop columns from investigation that already exist in df_export
             inv_drop_cols = [c for c in ["Product Description", "AverageCost"]
                             if c in df_investigation.columns]
             inv_clean = df_investigation.drop(columns=inv_drop_cols, errors="ignore")
@@ -847,7 +811,62 @@ if not account_id or not api_key:
     )
     st.stop()
 
-# --- Step 1: File Upload & Variance Analysis ---
+# -------------------------
+# Sidebar: Reference Data Loader
+# -------------------------
+with st.sidebar:
+    st.header("Reference Data")
+
+    ref_data = st.session_state.get("ref_data")
+    if ref_data:
+        st.success(f"Loaded at {ref_data['loaded_at']}")
+        st.caption(
+            f"SOH: {len(ref_data['soh_data']):,} SKUs | "
+            f"BOM: {len(ref_data['bom_index']):,} components | "
+            f"ST: {len(ref_data['stock_take_data']):,} SKUs"
+        )
+        load_label = "Refresh Reference Data"
+    else:
+        st.warning("Not loaded yet")
+        st.caption("Load reference data to enable investigation. This fetches SOH, BOM, and stock take history for all products.")
+        load_label = "Load Reference Data"
+
+    load_btn = st.button(load_label, use_container_width=True)
+
+    if load_btn:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        client = Cin7Client(account_id, api_key)
+        try:
+            st.session_state.ref_data = load_reference_data(client, progress_bar, status_text)
+            # Clear any previous investigation since ref data changed
+            for key in ["df_investigation", "df_bom", "po_data", "po_debug"]:
+                st.session_state.pop(key, None)
+        except requests.HTTPError as e:
+            st.error(f"API error: {e}")
+        except requests.ConnectionError:
+            st.error("Could not connect to Cin7 Core API.")
+        finally:
+            progress_bar.empty()
+            status_text.empty()
+        st.rerun()
+
+    # PO Debug expander in sidebar
+    po_debug = st.session_state.get("po_debug")
+    if po_debug:
+        with st.expander("PO Debug", expanded=False):
+            st.write(f"**SKUs queried:** {po_debug.get('skus_queried', '?')}")
+            st.write(f"**SKUs with PO data:** {po_debug.get('skus_with_po', '?')}")
+            st.write(f"**Total movements seen:** {po_debug.get('total_movements_seen', '?')}")
+            if po_debug.get("errors"):
+                st.write("**Errors:**")
+                for err in po_debug["errors"][:10]:
+                    st.write(f"- {err}")
+
+
+# -------------------------
+# Step 1: File Upload & Variance Analysis
+# -------------------------
 with st.form("inputs"):
     st.subheader("Upload your Stocktake PDF")
     pdf_upload = st.file_uploader("Stocktake Variance Table PDF", type=["pdf"])
@@ -885,7 +904,7 @@ if run_btn:
         df_grouped_sorted = group_and_sort(st.session_state.df_refined)
         st.session_state.df_merged = merge_with_inventory(df_grouped_sorted, df_inventory)
 
-    # Build Excel without investigation (user can add it next)
+    # Build Excel without investigation
     st.session_state.excel_bytes = build_excel(
         st.session_state.df_refined,
         st.session_state.df_merged,
@@ -913,6 +932,96 @@ c1.metric("Total Products", f"{total_products:,}")
 c2.metric("Total Variance Amount", f"R{total_variance_amount:,.2f}")
 c3.metric("Top 80% Variance Items", f"{top80_count:,}")
 
+# -------------------------
+# Investigation Slider (reactive, no button needed)
+# -------------------------
+st.divider()
+st.subheader("Variance Investigation")
+
+ref_data = st.session_state.get("ref_data")
+
+if not ref_data:
+    st.info("Load reference data from the sidebar first to enable investigation.")
+else:
+    max_skus = len(df_merged)
+    default_n = min(25, max_skus)
+
+    top_n = st.slider(
+        "Number of top SKUs to investigate (sorted by absolute variance):",
+        min_value=5,
+        max_value=max_skus,
+        value=default_n,
+        step=5,
+        key="top_n_slider",
+    )
+
+    # Build SKU lists for current top N
+    top_rows = df_merged.head(top_n)
+    top_skus = top_rows["Code"].dropna().astype(str).str.strip().tolist()
+    sku_desc_map = dict(zip(
+        top_rows["Code"].astype(str).str.strip(),
+        top_rows["Product Description"].fillna(""),
+    ))
+    sku_cost_map = dict(zip(
+        top_rows["Code"].astype(str).str.strip(),
+        top_rows["AverageCost"].fillna(0),
+    ))
+
+    # PO receiving: fetch via product movements (1 call per SKU)
+    po_data = st.session_state.get("po_data", {})
+    fetched_count = sum(1 for s in top_skus if s.upper() in po_data)
+
+    col_po_btn, col_po_status = st.columns([1, 2])
+    with col_po_btn:
+        fetch_po_btn = st.button(
+            "Fetch PO Data" if not po_data else "Refresh PO Data",
+            help=f"Fetch latest PO for each of the top {top_n} SKUs ({top_n} API calls)",
+        )
+    with col_po_status:
+        if po_data:
+            st.caption(f"PO data: {fetched_count}/{len(top_skus)} SKUs loaded")
+        else:
+            st.caption("No PO data loaded yet. Click to fetch.")
+
+    if fetch_po_btn:
+        po_progress = st.progress(0)
+        po_status = st.empty()
+        po_status.text(f"Fetching PO movements for {len(top_skus)} SKUs...")
+        client = Cin7Client(account_id, api_key)
+
+        def po_prog_cb(done, total):
+            po_progress.progress(
+                min(done / max(total, 1), 1.0),
+                text=f"Product movements: {done}/{total} SKUs",
+            )
+
+        try:
+            new_po_data, po_debug = fetch_po_data_via_movements(
+                client, top_skus, progress_cb=po_prog_cb,
+            )
+            # Merge new results into existing cache
+            po_data.update(new_po_data)
+            st.session_state.po_data = po_data
+            st.session_state.po_debug = po_debug
+        except requests.HTTPError as e:
+            st.warning(f"PO fetch partially failed: {e}")
+
+        po_progress.empty()
+        po_status.empty()
+        st.rerun()
+
+    # Build investigation instantly from pre-loaded data + PO cache
+    df_investigation, df_bom = build_investigation_from_ref(
+        ref_data, top_skus, sku_desc_map, sku_cost_map, po_data=po_data,
+    )
+    st.session_state.df_investigation = df_investigation
+    st.session_state.df_bom = df_bom
+
+    # Rebuild Excel with investigation + BOM data
+    st.session_state.excel_bytes = build_excel(
+        df_refined, df_merged, df_investigation, df_bom,
+    )
+
 # Data tables
 tab1, tab2, tab3, tab4 = st.tabs([
     "Grouped & Sorted Data", "Investigation", "BOM Analysis", "Refined Data",
@@ -935,116 +1044,21 @@ with tab1:
 with tab2:
     if df_investigation is not None and not df_investigation.empty:
         st.dataframe(df_investigation, use_container_width=True, hide_index=True)
+    elif not ref_data:
+        st.info("Load reference data from the sidebar to enable investigation.")
     else:
-        st.info("Run the investigation below to enrich top SKUs with SOH, stock take, and PO receiving data.")
+        st.info("Adjust the slider above to investigate top SKUs.")
 
 with tab3:
     if df_bom is not None and not df_bom.empty:
         st.dataframe(df_bom, use_container_width=True, hide_index=True)
+    elif not ref_data:
+        st.info("Load reference data from the sidebar to see BOM relationships.")
     else:
-        st.info("Run the investigation below to see BOM relationships (exploded per parent).")
+        st.info("No BOM relationships found for the selected SKUs.")
 
 with tab4:
     st.dataframe(df_refined, use_container_width=True, hide_index=True)
-
-# --- Step 2: Investigation (separate, user-controlled) ---
-st.divider()
-st.subheader("Variance Investigation")
-
-max_skus = len(df_merged)
-default_n = min(25, max_skus)
-
-# Estimate: ~1 SOH per SKU + ~3 BOM bulk + ~6 stock takes + ~30 PO receiving
-def estimate_time(n):
-    total_calls = n + 40
-    minutes = total_calls / CALLS_PER_MINUTE
-    if minutes < 1:
-        return "< 1 min"
-    return f"~{minutes:.0f} min"
-
-top_n = st.slider(
-    "Number of top SKUs to investigate (sorted by absolute variance):",
-    min_value=5,
-    max_value=max_skus,
-    value=default_n,
-    step=5,
-)
-st.caption(f"Estimated time: **{estimate_time(top_n)}** ({top_n + 40} API calls at {CALLS_PER_MINUTE}/min)")
-
-investigate_btn = st.button("Run Investigation")
-
-if investigate_btn:
-    # Get top N SKUs by absolute variance (df_merged is already sorted desc)
-    top_rows = df_merged.head(top_n)
-    top_skus = top_rows["Code"].dropna().astype(str).str.strip().tolist()
-    sku_desc_map = dict(zip(
-        top_rows["Code"].astype(str).str.strip(),
-        top_rows["Product Description"].fillna(""),
-    ))
-    sku_cost_map = dict(zip(
-        top_rows["Code"].astype(str).str.strip(),
-        top_rows["AverageCost"].fillna(0),
-    ))
-
-    st.write(f"Investigating top **{len(top_skus)}** SKUs...")
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    client = Cin7Client(account_id, api_key)
-    po_debug = {}
-    try:
-        df_inv, df_bom_result, po_debug = run_investigation(
-            client, top_skus, progress_bar, status_text, sku_desc_map, sku_cost_map,
-        )
-        st.session_state.df_investigation = df_inv
-        st.session_state.df_bom = df_bom_result
-    except requests.HTTPError as e:
-        st.warning(f"Investigation partially failed: {e}")
-        st.session_state.df_investigation = pd.DataFrame()
-        st.session_state.df_bom = pd.DataFrame()
-
-    progress_bar.empty()
-    status_text.empty()
-    st.success(f"Investigation complete for **{len(top_skus)}** SKUs.")
-
-    # Store PO debug in session_state so it survives st.rerun()
-    if po_debug:
-        st.session_state.po_debug = po_debug
-
-    # Rebuild Excel with investigation + BOM data
-    with st.spinner("Rebuilding Excel file..."):
-        st.session_state.excel_bytes = build_excel(
-            st.session_state.df_refined,
-            st.session_state.df_merged,
-            st.session_state.get("df_investigation"),
-            st.session_state.get("df_bom"),
-        )
-
-    st.rerun()
-
-# --- PO Receiving Debug (persisted in session_state) ---
-po_debug = st.session_state.get("po_debug")
-if po_debug:
-    with st.expander("PO Receiving Debug Info", expanded=True):
-        st.write(f"**Total POs in list:** {po_debug.get('total_po_list', '?')}")
-        st.write(f"**CombinedReceivingStatus values seen:** {po_debug.get('statuses_seen', {})}")
-        st.write(f"**POs passing filter:** {po_debug.get('received_po_count', '?')}")
-        st.write(f"**PO details fetched:** {po_debug.get('details_checked', '?')}")
-        st.write(f"**Total stock lines found:** {po_debug.get('total_lines_found', '?')}")
-        st.write(f"**SKUs matched:** {po_debug.get('skus_matched', '?')}")
-        if po_debug.get("sample_po"):
-            st.write("**Sample PO (first in list):**")
-            st.json(po_debug["sample_po"])
-        if po_debug.get("sample_detail_keys"):
-            st.write(f"**Detail response keys:** {po_debug['sample_detail_keys']}")
-        if po_debug.get("sample_stock_received_type"):
-            st.write(f"**StockReceived type:** {po_debug['sample_stock_received_type']}")
-        if po_debug.get("sample_line_keys"):
-            st.write(f"**Stock line keys:** {po_debug['sample_line_keys']}")
-        if po_debug.get("errors"):
-            st.write("**Errors:**")
-            for err in po_debug["errors"][:10]:
-                st.write(f"- {err}")
 
 # --- Download ---
 st.divider()
