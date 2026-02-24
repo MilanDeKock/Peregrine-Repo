@@ -765,8 +765,8 @@ def build_excel(df_refined, df_merged, df_investigation=None, df_bom=None):
                 on="Code",
                 how="inner",
             )
-            inv_export.to_excel(writer, sheet_name="Investigation", index=False)
-            ws_inv = writer.sheets["Investigation"]
+            inv_export.to_excel(writer, sheet_name="Stock Movements", index=False)
+            ws_inv = writer.sheets["Stock Movements"]
             ws_inv.freeze_panes = "C2"
             if "Code" in inv_export.columns:
                 idx = inv_export.columns.get_loc("Code") + 1
@@ -1024,7 +1024,7 @@ else:
 
 # Data tables
 tab1, tab2, tab3, tab4 = st.tabs([
-    "Grouped & Sorted Data", "Investigation", "BOM Analysis", "Refined Data",
+    "Grouped & Sorted Data", "Stock Movements", "BOM Analysis", "Refined Data",
 ])
 
 with tab1:
